@@ -52,6 +52,18 @@ fn decode_note(bytes: &[u8], enc: &str) -> String {
     }
 }
 
+// Decode heading bytes: char = b&0x7F; if high bit set, append a space.
+fn decode_heading(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for &b in bytes {
+        s.push((b & 0x7f) as char);
+        if (b & 0x80) != 0 {
+            s.push(' ');
+        }
+    }
+    s
+}
+
 fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
     let mut i = 0usize;
     let mut out = Vec::<Rec>::new();
@@ -60,44 +72,37 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
     if buf.len() >= i + 6 && buf[i..i + 6] == PREAMBLE { i += 6; }
 
     while i < buf.len() {
-        // stop on trailing FF FF 1A
-        if i + 2 < buf.len() && buf[i] == 0xff && buf[i + 1] == 0xff && buf[i + 2] == 0x1a {
-            break;
-        }
+        // explicit EOF sentinels
+        if i == buf.len() - 1 && buf[i] == 0x1a { break; }
+        if i + 2 < buf.len() && buf[i] == 0xff && buf[i + 1] == 0xff && buf[i + 2] == 0x1a { break; }
 
-        // find start of printable ASCII heading
-        while i < buf.len() && !(buf[i] >= 0x20 && buf[i] <= 0x7e) {
-            i += 1;
-        }
-        if i >= buf.len() { break; }
-
-        // heading text up to 0xFF terminator
-        let start = i;
-        while i < buf.len() && (0x20..=0x7e).contains(&buf[i]) {
-            i += 1;
-        }
-        if i >= buf.len() || buf[i] != 0xff {
+        // Find next 0xFF; heading text may be zero-length.
+        let mut k = i;
+        while k < buf.len() && buf[k] != 0xff { k += 1; }
+        if k >= buf.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "unterminated heading text"));
         }
-        let text = String::from_utf8_lossy(&buf[start..i]).to_string();
 
-        // attr + marker (FF FF expanded, FE FF collapsed)
-        if i + 4 >= buf.len() {
+        if k + 4 >= buf.len() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated record header"));
         }
-        let attr = buf[i + 1];
-        let mark1 = buf[i + 2];
-        let mark2 = buf[i + 3];
+        let attr  = buf[k + 1];
+        let mark1 = buf[k + 2];
+        let mark2 = buf[k + 3];
+
+        // Stray 0xFF? (marker must be FE/FF followed by FF)
         if mark2 != 0xff || (mark1 != M_EXPANDED && mark1 != M_COLLAPSED) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad marker after heading"));
+            i = k + 1;
+            continue;
         }
+
+        // Valid record
+        let text = decode_heading(&buf[i..k]);
         let collapsed = mark1 == M_COLLAPSED;
+        let delta = i16::from_le_bytes([buf[k + 4], buf[k + 5]]);
+        i = k + 6;
 
-        // delta (i16 LE)
-        let delta = i16::from_le_bytes([buf[i + 4], buf[i + 5]]);
-        i += 6;
-
-        // optional note
+        // Optional note
         let mut note: Option<String> = None;
         if (attr & 0x80) != 0 {
             if i + 2 > buf.len() {
