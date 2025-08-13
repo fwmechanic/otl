@@ -1,0 +1,66 @@
+20250812_1455 Tue
+
+  Desperate to get this going on Linux (since GV2 is not really THAT great).
+
+  First, `apt install dosbox`
+  mkdir -p ~/dos/SKPLUS
+
+  dosbox config: edit ~/.dosbox/dosbox-*.conf
+
+  # to get near fullscreen size (on 1080p screen):
+  [sdl] windowresolution=1600x1000
+  [sdl] output=opengl
+  [render] frameskip=0
+  [render] aspect=true
+  [render] scaler=normal3x
+  [dosbox] machine=svga_s3
+  # for SKP, which ISTR used FCB's for some file accesses
+  [dos] fcbs=16,8
+
+  To start SKPLUS (or my customized version, SKPOTL.EXE):
+
+  [autoexec]
+  # Lines in this section will be run at startup.
+  # You can put your MOUNT lines here.
+  mount c ~/dos
+  c:
+  cd SKPLUS
+  # /G is "run on non-resident (non-TSR) mode" flag !!!
+  SKPOTL.EXE /G
+  exit
+
+
+  Downloaded floppy images from https://winworldpc.com/product/sidekick/plus
+
+  It *appears* that you only need to copy the contents of all 3 floppy images
+  into the "install dir" (e.g. C:\SKPLUS).  I used INSTALL.EXE to copy the
+  first floppy(image)s files there, but manually copied the other 2
+  floppy(image)s worth using the COPY command.  From there (C:\SKPLUS) I was able to run
+  INSTALL.EXE to customize the application in place (or have it update or
+  generate a customized .EXE file in C:\SKPLUS).
+
+  Gotcha: hit F2 to save current file: if dirty, a red error message "Unable
+  to create file" appears in ULC.
+  Fix: I seem to have fixed this by nav'ing somewhere in the menu structure
+  and disabling "create .BAK file" (presumably, when saving the OTL file).
+
+  Manual refs: (I already had): Borland.Sidekick.Plus.Owners.Handbook.1988.pdf
+  pg 335: Ch 15: "Designing your own SideKick Plus" (running INSTALL.EXE
+                 post-"install" to create an entirely new .EXE file
+                 customized to your requirements):
+
+          You can specify a new .EXE filename to contain the customized
+          version; I elected SKPOTL.EXE
+
+          I chose:
+            80x50 mode
+            data buffer = 100KB (recommended if running 80x50 mode)
+            ONLY Outlook (outline) app resident (and no others)
+            video adapter = "IBM Compatible"
+
+          This resulted in SKPOTL.EXE a 200.2KB file (vs SKPLUS.EXE, a 393.7KB file)
+
+          That's really all I care about.
+
+  pg 349: Ch 16: "Changing SideKick Plus from DOS"
+          `SKPLUS.EXE /G` is how you run in nonresident mode.
