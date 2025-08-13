@@ -190,6 +190,31 @@ fn render_indented(nodes: &[Node], prefix: &str) -> String {
     out
 }
 
+fn render_plain_all(nodes: &[Node], depth: usize) -> String {
+    let mut out = String::new();
+    for n in nodes {
+        if n.text != "<LEVEL>" {
+            let indent = " ".repeat(depth * 2);
+            out.push_str(&indent);
+            out.push_str(&n.text);
+            out.push('\n');
+
+            if let Some(note) = &n.note {
+                let note_indent = " ".repeat((depth + 1) * 2);
+                for line in note.replace("\r\n", "\n").lines() {
+                    out.push_str(&note_indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        // Always recurse (ignore collapsed state)
+        out.push_str(&render_plain_all(&n.children, depth + 1));
+    }
+    out
+}
+
+
 fn dump_recs(recs: &[Rec]) -> String {
     let mut lvl: i32 = 0;
     let mut s = String::new();
@@ -208,7 +233,7 @@ fn dump_recs(recs: &[Rec]) -> String {
 }
 
 fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {prog} <file | -> [--json] [--dump] [--enc utf8|latin1|ascii]");
+    eprintln!("Usage: {prog} <file | -> [--json] [--dump] [--enc utf8|latin1|ascii] [--text]");
     std::process::exit(2);
 }
 
@@ -216,6 +241,7 @@ fn main() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let mut file: Option<String> = None;
     let mut out_json = false;
+    let mut plain_text = false;
     let mut do_dump = false;
     let mut enc = String::from("latin1");
 
@@ -228,6 +254,7 @@ fn main() -> io::Result<()> {
                     usage(&env::args().next().unwrap_or_else(|| "otl".into()));
                 }
             }
+            "--text" => plain_text = true,
             _ => {
                 if file.is_none() { file = Some(a); }
                 else { usage(&env::args().next().unwrap_or_else(|| "otl".into())); }
@@ -254,6 +281,8 @@ fn main() -> io::Result<()> {
     let tree = build_tree(&recs);
     if out_json {
         println!("{}", serde_json::to_string_pretty(&tree).unwrap());
+    } else if plain_text {
+        print!("{}", render_plain_all(&tree, 0));
     } else {
         print!("{}", render_indented(&tree, ""));
     }
