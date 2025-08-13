@@ -6,9 +6,9 @@ use std::io::{self, Read};
 #[derive(Debug, Clone)]
 struct Rec {
     text: String,
-    delta: i16,          // relative level change
-    attr: u8,            // raw attribute flags
-    collapsed: bool,     // marker FE FF vs FF FF
+    delta: i16,      // relative level change
+    attr: u8,        // raw attribute flags
+    collapsed: bool, // marker FE FF vs FF FF
     note: Option<String>,
     flags: Flags,
 }
@@ -26,6 +26,8 @@ struct Node {
     note: Option<String>,
     collapsed: bool,
     flags: Flags,
+    #[serde(skip)]
+    synthetic: bool, // true for root / filler nodes
     children: Vec<Node>,
 }
 
@@ -33,6 +35,13 @@ const MAGIC: [u8; 3] = [0x1a, 0x93, 0x1a];
 const PREAMBLE: [u8; 6] = [0xff, 0x00, 0xff, 0xff, 0xff, 0xff];
 const M_EXPANDED: u8 = 0xff;
 const M_COLLAPSED: u8 = 0xfe;
+
+fn usage(prog: &str) -> ! {
+    eprintln!(
+        "Usage: {prog} <file | -> [--json] [--dump] [--enc utf8|latin1|ascii] [--text]"
+    );
+    std::process::exit(2);
+}
 
 fn decode_note(bytes: &[u8], enc: &str) -> String {
     match enc {
@@ -117,10 +126,11 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
 
 fn build_tree(recs: &[Rec]) -> Vec<Node> {
     let mut root = Node {
-        text: "<ROOT>".to_string(),
+        text: String::new(),
         note: None,
         collapsed: false,
         flags: Flags { has_note: false, selected: false, has_next_sibling: false },
+        synthetic: true,
         children: Vec::new(),
     };
 
@@ -136,10 +146,11 @@ fn build_tree(recs: &[Rec]) -> Vec<Node> {
         // if we jumped more than +1, create dummy intermediates
         while (path.len() as i32) < level {
             let dummy = Node {
-                text: "<LEVEL>".to_string(),
+                text: String::new(),
                 note: None,
                 collapsed: false,
                 flags: Flags { has_note: false, selected: false, has_next_sibling: false },
+                synthetic: true,
                 children: Vec::new(),
             };
             push_child(&mut root, &mut path, dummy);
@@ -150,6 +161,7 @@ fn build_tree(recs: &[Rec]) -> Vec<Node> {
             note: r.note.clone(),
             collapsed: r.collapsed,
             flags: r.flags.clone(),
+            synthetic: false,
             children: Vec::new(),
         };
         push_child(&mut root, &mut path, node);
@@ -159,8 +171,7 @@ fn build_tree(recs: &[Rec]) -> Vec<Node> {
 }
 
 fn push_child(root: &mut Node, path: &mut Vec<usize>, child: Node) {
-    // Walk down following path to get a mutable reference to the parent
-    // (we must re-borrow afresh to keep Rust borrow checker happy)
+    // Re-walk the path to get a fresh mutable reference to the parent.
     let mut ptr: *mut Node = root as *mut Node;
     unsafe {
         for &idx in path.iter() {
@@ -168,16 +179,43 @@ fn push_child(root: &mut Node, path: &mut Vec<usize>, child: Node) {
         }
         (*ptr).children.push(child);
         let new_idx = (*ptr).children.len() - 1;
-        path.push(new_idx); // make the new node the current context
+        path.push(new_idx); // make the new node current
     }
+}
+
+fn render_plain_all(nodes: &[Node], depth: usize) -> String {
+    let mut out = String::new();
+    for n in nodes {
+        if n.synthetic {
+            out.push_str(&render_plain_all(&n.children, depth));
+            continue;
+        }
+        let indent = " ".repeat(depth * 2);
+        out.push_str(&format!("{indent}{}\n", n.text));
+
+        if let Some(note) = &n.note {
+            let note_indent = " ".repeat((depth + 1) * 2);
+            for line in note.replace("\r\n", "\n").lines() {
+                out.push_str(&format!("{note_indent}{}\n", line));
+            }
+        }
+        // Always descend (ignore collapsed)
+        out.push_str(&render_plain_all(&n.children, depth + 1));
+    }
+    out
 }
 
 fn render_indented(nodes: &[Node], prefix: &str) -> String {
     let mut out = String::new();
     for n in nodes {
+        if n.synthetic {
+            out.push_str(&render_indented(&n.children, prefix));
+            continue;
+        }
         let fold = if n.collapsed { "[+]" } else { "[-]" };
         let sel  = if n.flags.selected { "*" } else { " " };
         out.push_str(&format!("{prefix}{fold}{sel} {}\n", n.text));
+
         if let Some(note) = &n.note {
             for line in note.replace("\r\n", "\n").lines() {
                 out.push_str(&format!("{prefix}    > {}\n", line));
@@ -189,31 +227,6 @@ fn render_indented(nodes: &[Node], prefix: &str) -> String {
     }
     out
 }
-
-fn render_plain_all(nodes: &[Node], depth: usize) -> String {
-    let mut out = String::new();
-    for n in nodes {
-        if n.text != "<LEVEL>" {
-            let indent = " ".repeat(depth * 2);
-            out.push_str(&indent);
-            out.push_str(&n.text);
-            out.push('\n');
-
-            if let Some(note) = &n.note {
-                let note_indent = " ".repeat((depth + 1) * 2);
-                for line in note.replace("\r\n", "\n").lines() {
-                    out.push_str(&note_indent);
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            }
-        }
-        // Always recurse (ignore collapsed state)
-        out.push_str(&render_plain_all(&n.children, depth + 1));
-    }
-    out
-}
-
 
 fn dump_recs(recs: &[Rec]) -> String {
     let mut lvl: i32 = 0;
@@ -232,29 +245,24 @@ fn dump_recs(recs: &[Rec]) -> String {
     s
 }
 
-fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {prog} <file | -> [--json] [--dump] [--enc utf8|latin1|ascii] [--text]");
-    std::process::exit(2);
-}
-
 fn main() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let mut file: Option<String> = None;
     let mut out_json = false;
-    let mut plain_text = false;
     let mut do_dump = false;
+    let mut plain_text = false;
     let mut enc = String::from("latin1");
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "--json" => out_json = true,
             "--dump" => do_dump = true,
+            "--text" => plain_text = true,
             "--enc" => {
                 if let Some(v) = args.next() { enc = v; } else {
                     usage(&env::args().next().unwrap_or_else(|| "otl".into()));
                 }
             }
-            "--text" => plain_text = true,
             _ => {
                 if file.is_none() { file = Some(a); }
                 else { usage(&env::args().next().unwrap_or_else(|| "otl".into())); }
@@ -275,7 +283,9 @@ fn main() -> io::Result<()> {
     let recs = parse_otl(&buf, &enc)?;
     if do_dump {
         print!("{}", dump_recs(&recs));
-        if !out_json { return Ok(()); }
+        if !out_json && !plain_text {
+            return Ok(());
+        }
     }
 
     let tree = build_tree(&recs);
