@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# watch-otl.sh -- byte + semantic (offset-free) diffs for .OTL files
+# watch-otl.sh -- watch one .OTL file OR all .OTL files in a directory.
+# - Archives every validated change (timestamped copy of the .OTL).
+# - Shows zero-context unified diffs of canonical output (note bodies omitted).
+# - No byte-level diffs.
+#
+# Env:
+#   OTL_ARCHDIR      Override archive dir (default: <dir>/.otl-archive)
+#   ALWAYS_ARCHIVE=1 Archive on every write, even if canonical unchanged
 
 die() { printf %s "${@+$@$'\n'}" 1>&2 ; exit 1 ; }
 see() ( { set -x; } 2>/dev/null ; "$@" )
@@ -7,123 +14,191 @@ have() { command -v "$1" &>/dev/null; }
 
 usage() {
   cat 1>&2 <<USAGE
-Usage: $(basename "$0") <file.OTL> [otl-args...]
+Usage:
+  $(basename "$0") <path-to-.OTL | directory> [otl-args...]
 
 Examples:
-  $(basename "$0") ~/SKPLUS/OUTLINE.OTL                # default: --canon
-  $(basename "$0") ~/SKPLUS/OUTLINE.OTL --validate     # add validator
+  $(basename "$0") ~/SKPLUS/OUTLINE.OTL --validate
+  $(basename "$0") ~/SKPLUS --validate
+
+Notes:
+  - Requires: inotifywait (inotify-tools), diff, awk.
+  - Finds 'otl' in PATH; else uses ./target/release/otl.
+  - Archives to: <dir>/.otl-archive/<name>.<YYYYMMDD_HHMMSS_mmm>.OTL
 USAGE
   exit 2
 }
 
-# --- args ---
+# -------- args --------
 [ $# -ge 1 ] || usage
-FILE=$1; shift || true
+TARGET=$1; shift || true
 EXTRA_ARGS=("$@")
 [[ ${EXTRA_ARGS[0]:-} == "--" ]] && EXTRA_ARGS=("${EXTRA_ARGS[@]:1}")
-[ -e "$FILE" ] || die "No such file: $FILE"
 
-# --- deps ---
+# -------- deps --------
 have inotifywait || die "Missing 'inotifywait' (sudo apt install inotify-tools)"
-have cmp         || die "Missing 'cmp'"
-have awk         || die "Missing 'awk'"
 have diff        || die "Missing 'diff'"
+have awk         || die "Missing 'awk'"
 
-# --- otl binary ---
+# -------- otl binary --------
 if have otl; then OTL=otl
 elif [ -x ./target/release/otl ]; then OTL=./target/release/otl
 else die "Could not find 'otl' (PATH or ./target/release/otl)"; fi
 
-# Default to canonical output (stable for diff)
+# Ensure --canon present (we'll filter note bodies below)
 case " ${EXTRA_ARGS[*]} " in
   *" --canon "*) : ;;
   *) EXTRA_ARGS=(--canon "${EXTRA_ARGS[@]}");;
 esac
 
-BASENAME=$(basename "$FILE")
-SNAP_BIN=$(mktemp -t ".snap.${BASENAME}.bin.XXXXXX")   || die "mktemp failed"
-SNAP_TXT=$(mktemp -t ".snap.${BASENAME}.txt.XXXXXX")   || die "mktemp failed"
-trap 'rm -f "$SNAP_BIN" "$SNAP_TXT" "$CURR_BIN" "$CURR_TXT"' EXIT
+abspath() { cd "$(dirname "$1")" && pwd -P; }
+is_otl() {
+  local f="$1"; case "$f" in
+    *.OTL|*.otl) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-cp -f -- "$FILE" "$SNAP_BIN" 2>/dev/null || :
-# Initialize canonical baseline
-CURR_TXT=$(mktemp -t ".curr.${BASENAME}.txt.XXXXXX") || die "mktemp failed"
-"$OTL" --canon "$FILE" >"$CURR_TXT" 2>/dev/null || true
-mv -f "$CURR_TXT" "$SNAP_TXT" 2>/dev/null || :
+# Per-dir state: archive + baseline store
+STATE_DIR() { local d; d="$(abspath "$1")"; printf %s "$d/.otl-watch"; }
+ARCH_DIR()  {
+  local d; d="$(abspath "$1")"
+  printf %s "${OTL_ARCHDIR:-$d/.otl-archive}"
+}
 
-echo "Watching: $FILE"
-echo "Using otl: $OTL ${EXTRA_ARGS[*]} $FILE"
-echo "Baselines: $SNAP_BIN  (bytes),  $SNAP_TXT  (canon)"
-echo
+# Produce canonical text with note bodies omitted (keeps [noteLen], [note], [/note])
+filter_canon() {
+  awk '
+    BEGIN { in_note=0 }
+    /^\[note\]$/   { in_note=1; print "[note]"; print "[note body omitted]"; next }
+    /^\[\/note\]$/ { in_note=0; print "[/note]"; next }
+    in_note == 1   { next }
+    { print }
+  ' "$1"
+}
 
-# pretty-print cmp -l (octal) as hex with original octal in parens
-fmt_cmp_hex='
-function o2d(s,  i,d,v){ v=0; for(i=1;i<=length(s);i++){ d=substr(s,i,1); v = v*8 + d } return v }
-{ off=$1-1; old=o2d($2); new=o2d($3);
-  printf "  0x%06X: 0x%02X (%03s) -> 0x%02X (%03s)\n", off, old, $2, new, $3
-}'
+# Build/refresh baseline for a file (if missing)
+ensure_baseline() {
+  local file="$1"
+  local sdir; sdir="$(STATE_DIR "$file")"
+  mkdir -p "$sdir" 2>/dev/null || :
+  local base="$sdir/$(basename "$file").canon.txt"
+  [ -f "$base" ] && return 0
 
-run_event() {
-  printf "\n=== %s ===\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+  local tmp; tmp="$(mktemp -t ".canon.$(basename "$file").XXXXXX")" || return 0
+  "$OTL" --canon "$file" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  filter_canon "$tmp" >"$base"
+  rm -f "$tmp"
+}
 
-  # Retry until parse succeeds
-  local tries=12 last_rc=1 last_out=""
+# Archive a validated snapshot
+archive_copy() {
+  local file="$1"
+  local arch; arch="$(ARCH_DIR "$file")"
+  mkdir -p "$arch" 2>/dev/null || :
+  local stem ext ts outpath
+  stem="$(basename "$file")"; ext="${stem##*.}"; stem="${stem%.*}"
+  ts=$(date +%Y%m%d_%H%M%S_%3N)
+  outpath="$arch/${stem}.${ts}.${ext}"
+  cp -f -- "$file" "$outpath" && echo "Archived: $outpath"
+}
+
+# Handle one write/rename event for a file
+handle_file_event() {
+  local file="$1"
+  is_otl "$file" || return 0
+  [ -f "$file" ] || return 0
+
+  ensure_baseline "$file"
+  local sdir base; sdir="$(STATE_DIR "$file")"; base="$sdir/$(basename "$file").canon.txt"
+
+  # Retry parse on partial writes
+  local tries=12 last_rc=1 canon_raw canon_filt warn tmpbin
   while (( tries-- > 0 )); do
-    CURR_BIN=$(mktemp -t ".curr.${BASENAME}.bin.XXXXXX") || die "mktemp failed"
-    cp -f -- "$FILE" "$CURR_BIN" 2>/dev/null || { rm -f "$CURR_BIN"; sleep 0.05; continue; }
+    tmpbin="$(mktemp -t ".curr.$(basename "$file").bin.XXXXXX")" || return 0
+    cp -f -- "$file" "$tmpbin" 2>/dev/null || { rm -f "$tmpbin"; sleep 0.05; continue; }
 
-    # Try canonical dump
-    CURR_TXT=$(mktemp -t ".curr.${BASENAME}.txt.XXXXXX") || die "mktemp failed"
-    last_out=$("$OTL" "${EXTRA_ARGS[@]}" "$CURR_BIN" >"$CURR_TXT" 2>&1); last_rc=$?
+    canon_raw="$(mktemp -t ".canon.$(basename "$file").raw.XXXXXX")" || { rm -f "$tmpbin"; return 0; }
+    # Capture warnings (stderr) separately
+    warn="$(mktemp -t ".otl.warn.XXXXXX")" || { rm -f "$tmpbin" "$canon_raw"; return 0; }
+    "$OTL" "${EXTRA_ARGS[@]}" "$tmpbin" >"$canon_raw" 2>"$warn"
+    last_rc=$?
     if (( last_rc == 0 )); then
-      # Byte deltas once
-      local DIFF
-      DIFF=$(cmp -l -- "$SNAP_BIN" "$CURR_BIN" 2>/dev/null || true)
-      if [ -n "$DIFF" ]; then
-        echo "Byte deltas:"
-        printf "%s\n" "$DIFF" | awk "$fmt_cmp_hex"
+      canon_filt="$(mktemp -t ".canon.$(basename "$file").filt.XXXXXX")" || { rm -f "$tmpbin" "$canon_raw" "$warn"; return 0; }
+      filter_canon "$canon_raw" >"$canon_filt"
+
+      local lbl_prev="prev($(basename "$file"))"
+      local lbl_curr="curr($(basename "$file"))"
+      local diffout
+      if [ -s "$base" ]; then
+        diffout=$(diff -u -U0 --label "$lbl_prev" --label "$lbl_curr" "$base" "$canon_filt" || true)
       else
-        echo "Byte deltas: (none)"
+        diffout=$(diff -u -U0 --label "$lbl_prev" --label "$lbl_curr" /dev/null "$canon_filt" || true)
       fi
 
-      # Semantic diff
-      local SEMDIFF
-      SEMDIFF=$(diff -u --label "prev(canon)" --label "curr(canon)" "$SNAP_TXT" "$CURR_TXT" || true)
-      if [ -n "$SEMDIFF" ]; then
-        echo "Semantic diff (canonical):"
-        printf "%s\n" "$SEMDIFF" | sed 's/^/  /'
+      printf "\n=== %s -- %s ===\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$file"
+      if [ -n "$diffout" ]; then
+        echo "Canonical diff (no context; note bodies omitted):"
+        printf "%s\n" "$diffout" | sed 's/^/  /'
+        archive_copy "$file"
       else
-        echo "Semantic diff (canonical): (none)"
+        echo "Canonical diff: (none)"
+        if [[ -n "${ALWAYS_ARCHIVE:-}" ]]; then archive_copy "$file"; fi
       fi
 
-      # Optional: print validator/output if user asked (e.g., --validate)
-      # (stdout already captured to CURR_TXT; only stderr warnings remain)
-      if [ -n "$last_out" ]; then
-        echo "+ $OTL ${EXTRA_ARGS[*]} $FILE"
-        printf "%s\n" "$last_out" | sed 's/^/  /'
+      # Validator warnings (if user supplied --validate)
+      if [ -s "$warn" ]; then
+        echo "Validator:"
+        sed 's/^/  /' "$warn"
       fi
 
-      # Promote baselines
-      cp -f -- "$CURR_BIN" "$SNAP_BIN" 2>/dev/null || :
-      mv -f -- "$CURR_TXT" "$SNAP_TXT" 2>/dev/null || :
-      rm -f "$CURR_BIN"
+      # Promote baseline
+      mv -f -- "$canon_filt" "$base" 2>/dev/null || :
+      rm -f "$tmpbin" "$canon_raw" "$warn"
       return 0
     fi
-
-    rm -f "$CURR_BIN" "$CURR_TXT"
+    rm -f "$tmpbin" "$canon_raw" "$warn"
     sleep 0.07
   done
 
-  echo "Parse never succeeded; last output:"
-  printf "%s\n" "$last_out" | sed 's/^/  /'
+  printf "\n=== %s -- %s ===\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$file"
+  echo "Parse never succeeded (skipping archive)."
+  return 1
 }
 
-while :; do
-  [ -e "$FILE" ] || {
-    printf "Waiting for %s to appear...\n" "$FILE"
-    inotifywait -qq -e create -e moved_to -- "$(dirname "$FILE")" || die "inotifywait failed"
-    continue
-  }
-  inotifywait -qq -e close_write -- "$FILE" || { sleep 0.1; continue; }
-  run_event
-done
+# -------- main --------
+if [ -d "$TARGET" ]; then
+  DIR="$(cd "$TARGET" && pwd -P)"
+  # Build baselines for existing *.OTL files
+  shopt -s nullglob
+  for f in "$DIR"/*.OTL "$DIR"/*.otl; do ensure_baseline "$f"; done
+  shopt -u nullglob
+
+  echo "Watching directory: $DIR"
+  echo "Using otl: $OTL ${EXTRA_ARGS[*]} (applied per file)"
+  echo "Archive base: $(ARCH_DIR "$DIR")"
+  echo
+
+  # Monitor directory for close_write and moved_to
+  inotifywait -m -q -e close_write -e moved_to --format '%e %w%f' -- "$DIR" \
+  | while read -r ev path; do
+      is_otl "$path" || continue
+      # coalesce flurries per path (optional; simple small delay)
+      handle_file_event "$path"
+    done
+
+elif [ -f "$TARGET" ]; then
+  FILE="$(cd "$(dirname "$TARGET")" && pwd -P)/$(basename "$TARGET")"
+  ensure_baseline "$FILE"
+  echo "Watching file: $FILE"
+  echo "Using otl: $OTL ${EXTRA_ARGS[*]}"
+  echo "Archive base: $(ARCH_DIR "$FILE")"
+  echo
+
+  inotifywait -m -q -e close_write --format '%w%f' -- "$FILE" \
+  | while read -r path; do
+      handle_file_event "$path"
+    done
+else
+  die "Target is neither a file nor a directory: $TARGET"
+fi
