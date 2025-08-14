@@ -49,12 +49,12 @@ const PREAMBLE: [u8; 6] = [0xff, 0x00, 0xff, 0xff, 0xff, 0xff];
 const M_EXPANDED: u8 = 0xff;
 const M_COLLAPSED: u8 = 0xfe;
 
+// Guardrails (format is 16-bit; this just prevents runaway reads)
+const MAX_TEXTLEN: usize = 1 << 20; // 1 MiB heading (paranoid limit)
+const MAX_NOTELEN: usize = 0xFFFF;  // format max (u16)
+
 fn usage(prog: &str) -> ! {
-    eprintln!(
-        "Usage: {prog} <file | -> \
-         [--json] [--dump] [--offsets] [--validate] \
-         [--enc utf8|latin1|ascii] [--text] [--canon]"
-    );
+    eprintln!("Usage: {prog} <file | -> [--json] [--dump] [--offsets] [--validate] [--enc utf8|latin1|ascii] [--text] [--canon] [--diff <prev> <curr>]");
     std::process::exit(2);
 }
 
@@ -120,6 +120,9 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
 
         let off_text = i;
         let len_text = k - i;
+        if len_text > MAX_TEXTLEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "heading too large"));
+        }
         let off_terminator = k;
         let off_attr = k + 1;
         let off_marker = k + 2;
@@ -139,6 +142,9 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
             }
             off_note_len = Some(i);
             let nlen = u16::from_le_bytes([buf[i], buf[i + 1]]) as usize;
+            if nlen > MAX_NOTELEN {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "note too large for u16 length"));
+            }
             i += 2;
             if i + nlen > buf.len() {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated note bytes"));
@@ -278,10 +284,7 @@ fn dump_recs(recs: &[Rec]) -> String {
         let sel = if r.flags.selected { 'S' } else { ' ' };
         let nxt = if r.flags.has_next_sibling { 'N' } else { ' ' };
         let nlen = r.note_len;
-        s.push_str(&format!(
-            "{:>4}  L={:>3}  d={:>3}  attr=0x{:02x}  {} {} {}  note={:>5}  {}\n",
-            idx, lvl, r.delta, r.attr, c, sel, nxt, nlen, r.text
-        ));
+        s.push_str(&format!("{:>4}  L={:>3}  d={:>3}  attr=0x{:02x}  {} {} {}  note={:>5}  {}\n", idx, lvl, r.delta, r.attr, c, sel, nxt, nlen, r.text));
     }
     s
 }
@@ -290,9 +293,7 @@ fn dump_offsets(recs: &[Rec]) -> String {
     let mut s = String::new();
     for (idx, r) in recs.iter().enumerate() {
         let m = if r.collapsed { "FE FF" } else { "FF FF" };
-        s.push_str(&format!(
-            "#{:03} text[{:#06x}+{:>4}] 0xFF[{:#06x}] attr[{:#06x}=0x{:02x}] \
-mark[{:#06x}={:<5}] delta[{:#06x}]{}{}  {}\n",
+        s.push_str(&format!("#{:03} text[{:#06x}+{:>4}] 0xFF[{:#06x}] attr[{:#06x}=0x{:02x}] mark[{:#06x}={:<5}] delta[{:#06x}]{}{}  {}\n",
             idx,
             r.off_text, r.len_text,
             r.off_terminator,
@@ -343,10 +344,12 @@ fn fmt_attr_bits(attr: u8) -> String {
 }
 
 /// Offset-free, insertion-stable, bit-complete dump:
-/// [attr,abcdefgh] [mark,%04x] [delta,%04x] [textLen,%04x] "text"
+/// [attr,abcdefgh] [mark,%04x] [delta,%04x;+d] [textLen,%04x] "text"
 /// If a note exists, emit on following lines:
 ///   [noteLen=%04x]
+///   [note]
 ///   <note text...>   (CRLF normalized to LF)
+///   [/note]
 fn render_canon(recs: &[Rec]) -> String {
     let mut out = String::new();
     for r in recs {
@@ -357,24 +360,16 @@ fn render_canon(recs: &[Rec]) -> String {
         // raw length from file
         let text_len_raw: u16 = r.len_text as u16;
 
-        out.push_str(&format!(
-            "[attr,{}] [mark,{:04x}] [delta,{:04x}] [textLen,{:04x}] \"{}\"\n",
-            fmt_attr_bits(r.attr),
-            mark_le,
-            delta_raw,
-            text_len_raw,
-            escape_headline(&r.text)
-        ));
+        out.push_str(&format!("[attr,{}] [mark,{:04x}] [delta,{:04x};{:+}] [textLen,{:04x}] \"{}\"\n",
+            fmt_attr_bits(r.attr), mark_le, delta_raw, r.delta, text_len_raw, escape_headline(&r.text)));
 
         if r.flags.has_note {
             out.push_str(&format!("[noteLen={:04x}]\n", r.note_len as u16));
-            if let Some(note) = &r.note {
-                let note_norm = note.replace("\r\n", "\n");
-                out.push_str(&note_norm);
-                if !note_norm.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
+            out.push_str("[note]\n");
+            let note_norm = r.note.as_deref().unwrap_or("").replace("\r\n", "\n");
+            out.push_str(&note_norm);
+            if !note_norm.ends_with('\n') { out.push('\n'); }
+            out.push_str("[/note]\n");
         }
     }
     out
@@ -401,10 +396,12 @@ fn validate(recs: &[Rec]) {
         }
         let bit = (recs[i].attr & 0x08) != 0;
         if has_later_sibling != bit {
-            eprintln!(
-              "WARN: rec #{:03} sibling bit mismatch (attr={}, expected={}) at attr[{:#06x}]",
-              i, bit, has_later_sibling, recs[i].off_attr
-            );
+            eprintln!("WARN: rec #{:03} sibling bit mismatch (attr={}, expected={}) at attr[{:#06x}]", i, bit, has_later_sibling, recs[i].off_attr);
+        }
+        // Unknown attr bits warning (anything outside 0x80,0x20,0x08)
+        let unknown = recs[i].attr & !(0x80 | 0x20 | 0x08);
+        if unknown != 0 {
+            eprintln!("WARN: rec #{:03} unknown attr bits set: 0x{:02x} at attr[{:#06x}]", i, unknown, recs[i].off_attr);
         }
     }
 
@@ -415,7 +412,94 @@ fn validate(recs: &[Rec]) {
     }
 }
 
+/**************
+ * --diff mode
+ **************/
+fn render_mark(collapsed: bool) -> &'static str { if collapsed { "fffe" } else { "ffff" } }
+fn render_delta(r: &Rec) -> String { format!("{:04x};{:+}", r.delta as u16, r.delta) }
+
+fn diff_two_recs(prev: &Rec, curr: &Rec) -> Vec<String> {
+    let mut changes = Vec::new();
+    if prev.attr != curr.attr {
+        changes.push(format!("  attr: {} -> {}", fmt_attr_bits(prev.attr), fmt_attr_bits(curr.attr)));
+    }
+    if prev.collapsed != curr.collapsed {
+        changes.push(format!("  mark: {} -> {}", render_mark(prev.collapsed), render_mark(curr.collapsed)));
+    }
+    if prev.delta != curr.delta {
+        changes.push(format!("  delta: {} -> {}", render_delta(prev), render_delta(curr)));
+    }
+    if prev.len_text != curr.len_text {
+        changes.push(format!("  textLen: {:04x} -> {:04x}", prev.len_text as u16, curr.len_text as u16));
+    }
+    if prev.note_len != curr.note_len {
+        changes.push(format!("  noteLen: {:04x} -> {:04x}", prev.note_len as u16, curr.note_len as u16));
+    }
+    let prev_note = prev.note.as_deref().unwrap_or("");
+    let curr_note = curr.note.as_deref().unwrap_or("");
+    if prev_note != curr_note {
+        if prev.note_len == curr.note_len {
+            changes.push("  note: (text changed)".to_string());
+        } else {
+            changes.push("  note: (length and text changed)".to_string());
+        }
+    }
+    changes
+}
+
+fn diff_mode(prev: &[Rec], curr: &[Rec]) -> String {
+    // Greedy match by heading text (first unmatched occurrence)
+    let mut out = String::new();
+    let mut used_prev = vec![false; prev.len()];
+
+    for c in curr.iter() {
+        // find first unmatched prev with identical text
+        let mut match_idx: Option<usize> = None;
+        for (j, p) in prev.iter().enumerate() {
+            if !used_prev[j] && p.text == c.text {
+                match_idx = Some(j);
+                break;
+            }
+        }
+        if let Some(j) = match_idx {
+            used_prev[j] = true;
+            let changes = diff_two_recs(&prev[j], c);
+            if !changes.is_empty() {
+                out.push_str(&format!("~ \"{}\"\n", c.text));
+                for line in changes { out.push_str(&line); out.push('\n'); }
+            }
+        } else {
+            out.push_str(&format!("+ \"{}\"\n", c.text));
+        }
+    }
+    for (j, p) in prev.iter().enumerate() {
+        if !used_prev[j] {
+            out.push_str(&format!("- \"{}\"\n", p.text));
+        }
+    }
+    out
+}
+
 fn main() -> io::Result<()> {
+    // Fast path: --diff <prev> <curr>
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if raw_args.get(0).map(|s| s.as_str()) == Some("--diff") {
+        if raw_args.len() != 3 {
+            usage(&env::args().next().unwrap_or_else(|| "otl".into()));
+        }
+        let prev_path = &raw_args[1];
+        let curr_path = &raw_args[2];
+        let prev_buf = fs::read(prev_path)?;
+        let curr_buf = fs::read(curr_path)?;
+        // default encoding latin1 for diff mode
+        let prev_recs = parse_otl(&prev_buf, "latin1")?;
+        let curr_recs = parse_otl(&curr_buf, "latin1")?;
+        let report = diff_mode(&prev_recs, &curr_recs);
+        print!("{report}");
+        return Ok(());
+    }
+
+    // Normal modes
     let mut args = env::args().skip(1);
     let mut file: Option<String> = None;
     let mut out_json = false;
