@@ -26,11 +26,16 @@ struct Rec {
     note_len: usize,
 }
 
+const A_NOTE:    u8 = 0x80; // has a trailing note
+const A_CURSOR:  u8 = 0x20; // cursor is somewhere in this heading
+const A_SIBLING: u8 = 0x08; // has any later sibling at the same level (before subtree ends)
+const A_HASKIDS: u8 = 0x04; // has >=1 child
+
 #[derive(Debug, Clone, Serialize)]
 struct Flags {
-    has_note: bool,        // attr & 0x80
-    selected: bool,        // attr & 0x20 (caret on this heading)
-    has_next_sibling: bool // attr & 0x08 (UI hint: there is a later sibling at same level)
+    has_note: bool,        // attr & A_NOTE
+    selected: bool,        // attr & A_CURSOR (caret on this heading)
+    has_next_sibling: bool // attr & A_SIBLING (UI hint: there is a later sibling at same level)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,7 +141,7 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
         let mut off_note: Option<usize> = None;
         let mut note_len: usize = 0;
 
-        if (attr & 0x80) != 0 {
+        if (attr & A_NOTE) != 0 {
             if i + 2 > buf.len() {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated note length"));
             }
@@ -156,9 +161,9 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
         }
 
         let flags = Flags {
-            has_note: (attr & 0x80) != 0,
-            selected: (attr & 0x20) != 0,
-            has_next_sibling: (attr & 0x08) != 0,
+            has_note: (attr & A_NOTE) != 0,
+            selected: (attr & A_CURSOR) != 0,
+            has_next_sibling: (attr & A_SIBLING) != 0,
         };
 
         out.push(Rec {
@@ -323,9 +328,9 @@ fn escape_headline(s: &str) -> String {
 
 // Format attr as 8 characters (bits 7..0):
 // Known bits use letters (lowercase=0, UPPER=1):
-//   0x80 -> n/N (note present)
-//   0x20 -> c/C (cursor/selected)
-//   0x08 -> m/M (more siblings at same level)
+//   A_NOTE -> n/N (note present)
+//   A_CURSOR -> c/C (cursor/selected)
+//   A_SIBLING -> m/M (more siblings at same level)
 // Unknown bits print '0' or '1'.
 fn fmt_attr_bits(attr: u8) -> String {
     let mut s = String::with_capacity(8);
@@ -333,10 +338,11 @@ fn fmt_attr_bits(attr: u8) -> String {
         let mask = 1u8 << i;
         let set = (attr & mask) != 0;
         let ch = match mask {
-            0x80 => if set { 'N' } else { 'n' },
-            0x20 => if set { 'C' } else { 'c' },
-            0x08 => if set { 'M' } else { 'm' },
-            _ => if set { '1' } else { '0' },
+            A_NOTE    => if set { 'N' } else { 'n' },
+            A_CURSOR  => if set { 'C' } else { 'c' },
+            A_SIBLING => if set { 'M' } else { 'm' },
+            A_HASKIDS => if set { 'H' } else { 'h' },
+            _         => if set { '1' } else { '_' },
         };
         s.push(ch);
     }
@@ -386,7 +392,7 @@ fn validate(recs: &[Rec]) {
         levels.push(lvl);
     }
 
-    // 0x08 = has any later sibling at the same level (before subtree ends)
+    // A_SIBLING = has any later sibling at the same level (before subtree ends)
     for i in 0..recs.len() {
         let my = levels[i];
         let mut has_later_sibling = false;
@@ -394,12 +400,22 @@ fn validate(recs: &[Rec]) {
             if levels[j] < my { break; }          // left this subtree
             if levels[j] == my { has_later_sibling = true; break; }
         }
-        let bit = (recs[i].attr & 0x08) != 0;
+        let bit = (recs[i].attr & A_SIBLING) != 0;
         if has_later_sibling != bit {
             eprintln!("WARN: rec #{:03} sibling bit mismatch (attr={}, expected={}) at attr[{:#06x}]", i, bit, has_later_sibling, recs[i].off_attr);
         }
-        // Unknown attr bits warning (anything outside 0x80,0x20,0x08)
-        let unknown = recs[i].attr & !(0x80 | 0x20 | 0x08);
+
+        let has_child = i + 1 < recs.len() && levels[i + 1] > my;
+        let bit_child = (recs[i].attr & A_HASKIDS) != 0;
+        if has_child != bit_child {
+            eprintln!(
+              "WARN: rec #{:03} child bit mismatch (attr={}, expected={}) at attr[{:#06x}]",
+              i, bit_child, has_child, recs[i].off_attr
+            );
+        }
+
+        // Unknown bits: exclude the four mapped ones
+        let unknown = recs[i].attr & !(A_NOTE | A_CURSOR | A_SIBLING | A_HASKIDS);
         if unknown != 0 {
             eprintln!("WARN: rec #{:03} unknown attr bits set: 0x{:02x} at attr[{:#06x}]", i, unknown, recs[i].off_attr);
         }
