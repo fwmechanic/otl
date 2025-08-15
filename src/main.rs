@@ -3,12 +3,19 @@ use std::env;
 use std::fs;
 use std::io::{self, Read};
 
+/// Attribute bits we (currently) know
+const A_NOTE: u8 = 0x80;        // has note bytes (then u16 noteLen + bytes)
+const A_CURSOR: u8 = 0x20;      // caret on this heading (displayed only with --show-cursor)
+const A_SIBFOLLOWS: u8 = 0x08;  // there exists a later sibling at same level
+const A_HASKIDS: u8 = 0x04;     // semantics under study; shown as k/K; validation optional
+
 #[derive(Debug, Clone)]
 struct Rec {
     text: String,
-    delta: i16,      // relative level change (i16 LE)
-    attr: u8,        // raw attribute flags
-    collapsed: bool, // marker FE FF vs FF FF
+    delta: i16,        // relative level change (i16 LE)
+    attr: u8,          // raw attribute flags
+    marker_u16: u16,   // raw marker word (FFFF/-1 expanded, FFFE/-2 collapsed)
+    collapsed: bool,   // convenience (marker == FFFE)
     note: Option<String>,
     flags: Flags,
 
@@ -26,16 +33,12 @@ struct Rec {
     note_len: usize,
 }
 
-const A_NOTE:    u8 = 0x80; // has a trailing note
-const A_CURSOR:  u8 = 0x20; // cursor is somewhere in this heading
-const A_SIBLING: u8 = 0x08; // has any later sibling at the same level (before subtree ends)
-const A_HASKIDS: u8 = 0x04; // has >=1 child
-
 #[derive(Debug, Clone, Serialize)]
 struct Flags {
-    has_note: bool,        // attr & A_NOTE
-    selected: bool,        // attr & A_CURSOR (caret on this heading)
-    has_next_sibling: bool // attr & A_SIBLING (UI hint: there is a later sibling at same level)
+    has_note: bool,         // attr & 0x80
+    selected: bool,         // attr & 0x20
+    has_next_sibling: bool, // attr & 0x08
+    has_child: bool,        // attr & 0x04 (shown only)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,12 +57,18 @@ const PREAMBLE: [u8; 6] = [0xff, 0x00, 0xff, 0xff, 0xff, 0xff];
 const M_EXPANDED: u8 = 0xff;
 const M_COLLAPSED: u8 = 0xfe;
 
-// Guardrails (format is 16-bit; this just prevents runaway reads)
+// Guardrails (format is 16-bit; these just prevent runaway reads)
 const MAX_TEXTLEN: usize = 1 << 20; // 1 MiB heading (paranoid limit)
 const MAX_NOTELEN: usize = 0xFFFF;  // format max (u16)
 
 fn usage(prog: &str) -> ! {
-    eprintln!("Usage: {prog} <file | -> [--json] [--dump] [--offsets] [--validate] [--enc utf8|latin1|ascii] [--text] [--canon] [--diff <prev> <curr>]");
+    eprintln!(
+        "Usage: {prog} <file | -> \
+         [--json] [--dump] [--offsets] [--validate] \
+         [--enc utf8|latin1|ascii] [--text] [--canon] \
+         [--show-cursor] [--assume-child-bit] \
+         [--diff <prev> <curr>]"
+    );
     std::process::exit(2);
 }
 
@@ -120,7 +129,8 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
         // Valid record
         let text_bytes = &buf[i..k];
         let text = decode_heading(text_bytes);
-        let collapsed = mark1 == M_COLLAPSED;
+        let marker_u16 = u16::from_le_bytes([mark1, mark2]);
+        let collapsed = marker_u16 == 0xFFFE;
         let delta = i16::from_le_bytes([buf[k + 4], buf[k + 5]]);
 
         let off_text = i;
@@ -161,13 +171,14 @@ fn parse_otl(buf: &[u8], note_enc: &str) -> io::Result<Vec<Rec>> {
         }
 
         let flags = Flags {
-            has_note: (attr & A_NOTE) != 0,
-            selected: (attr & A_CURSOR) != 0,
-            has_next_sibling: (attr & A_SIBLING) != 0,
+            has_note:         (attr & A_NOTE) != 0,
+            selected:         (attr & A_CURSOR) != 0,
+            has_next_sibling: (attr & A_SIBFOLLOWS) != 0,
+            has_child:        (attr & A_HASKIDS) != 0, // shown, not validated by default
         };
 
         out.push(Rec {
-            text, delta, attr, collapsed, note, flags,
+            text, delta, attr, marker_u16, collapsed, note, flags,
             off_text, len_text, off_terminator, off_attr, off_marker, off_delta, off_note_len, off_note,
             note_len,
         });
@@ -181,7 +192,7 @@ fn build_tree(recs: &[Rec]) -> Vec<Node> {
         text: String::new(),
         note: None,
         collapsed: false,
-        flags: Flags { has_note: false, selected: false, has_next_sibling: false },
+        flags: Flags { has_note: false, selected: false, has_next_sibling: false, has_child: false },
         synthetic: true,
         children: Vec::new(),
     };
@@ -201,7 +212,7 @@ fn build_tree(recs: &[Rec]) -> Vec<Node> {
                 text: String::new(),
                 note: None,
                 collapsed: false,
-                flags: Flags { has_note: false, selected: false, has_next_sibling: false },
+                flags: Flags { has_note: false, selected: false, has_next_sibling: false, has_child: false },
                 synthetic: true,
                 children: Vec::new(),
             };
@@ -287,9 +298,12 @@ fn dump_recs(recs: &[Rec]) -> String {
         lvl += r.delta as i32;
         let c = if r.collapsed { 'C' } else { 'E' };
         let sel = if r.flags.selected { 'S' } else { ' ' };
-        let nxt = if r.flags.has_next_sibling { 'N' } else { ' ' };
+        let nxt = if r.flags.has_next_sibling { 'S' } else { ' ' }; // 'S' to hint "sib follows"
         let nlen = r.note_len;
-        s.push_str(&format!("{:>4}  L={:>3}  d={:>3}  attr=0x{:02x}  {} {} {}  note={:>5}  {}\n", idx, lvl, r.delta, r.attr, c, sel, nxt, nlen, r.text));
+        s.push_str(&format!(
+            "{:>4}  L={:>3}  d={:>3}  attr=0x{:02x}  {} {} {}  note={:>5}  {}\n",
+            idx, lvl, r.delta, r.attr, c, sel, nxt, nlen, r.text
+        ));
     }
     s
 }
@@ -298,7 +312,9 @@ fn dump_offsets(recs: &[Rec]) -> String {
     let mut s = String::new();
     for (idx, r) in recs.iter().enumerate() {
         let m = if r.collapsed { "FE FF" } else { "FF FF" };
-        s.push_str(&format!("#{:03} text[{:#06x}+{:>4}] 0xFF[{:#06x}] attr[{:#06x}=0x{:02x}] mark[{:#06x}={:<5}] delta[{:#06x}]{}{}  {}\n",
+        s.push_str(&format!(
+            "#{:03} text[{:#06x}+{:>4}] 0xFF[{:#06x}] attr[{:#06x}=0x{:02x}] \
+mark[{:#06x}={:<5}] delta[{:#06x}]{}{}  {}\n",
             idx,
             r.off_text, r.len_text,
             r.off_terminator,
@@ -326,63 +342,90 @@ fn escape_headline(s: &str) -> String {
     out
 }
 
-// Format attr as 8 characters (bits 7..0):
-// Known bits use letters (lowercase=0, UPPER=1):
-//   A_NOTE -> n/N (note present)
-//   A_CURSOR -> c/C (cursor/selected)
-//   A_SIBLING -> m/M (more siblings at same level)
-// Unknown bits print '0' or '1'.
-fn fmt_attr_bits(attr: u8) -> String {
-    let mut s = String::with_capacity(8);
+// Format attr bits as a compact string (bits 7..0):
+// Known bits -> letters (lowercase=0, UPPER=1):
+//   0x80 -> n/N (note present)
+//   0x20 -> c/C (cursor/selected) -- printed only if show_cursor=true
+//   0x08 -> s/S (sibling follows later at this level)
+//   0x04 -> k/K (bit present; semantics under study)
+// Unknown bits: print '1' when set; print nothing when clear.
+fn fmt_attr_bits(attr: u8, show_cursor: bool) -> String {
+    let mut s = String::new();
     for i in (0..8).rev() {
         let mask = 1u8 << i;
         let set = (attr & mask) != 0;
         let ch = match mask {
-            A_NOTE    => if set { 'N' } else { 'n' },
-            A_CURSOR  => if set { 'C' } else { 'c' },
-            A_SIBLING => if set { 'M' } else { 'm' },
-            A_HASKIDS => if set { 'H' } else { 'h' },
-            _         => if set { '1' } else { '_' },
+            x if x == A_NOTE        => if set { 'N' } else { 'n' },
+            x if x == A_CURSOR      => {
+                if !show_cursor { '\0' } else { if set { 'C' } else { 'c' } }
+            }
+            x if x == A_SIBFOLLOWS  => if set { 'S' } else { 's' },
+            x if x == A_HASKIDS     => if set { 'K' } else { 'k' },
+            _                       => if set { '1' } else { '\0' },
         };
-        s.push(ch);
+        if ch != '\0' { s.push(ch); }
     }
     s
 }
 
+fn mark_field(u: u16) -> String {
+    let s = u as i16;
+    match s {
+        -1 => "-1:+".to_string(),
+        -2 => "-2:-".to_string(),
+        _  => format!("0x{:04x}", u),
+    }
+}
+
+// Print signed single-digit deltas with a sign ("+0","-1","+7");
+// fall back to raw 16-bit hex for anything outside -9..9.
+fn delta_field(d: i16) -> String {
+    if (-9..=9).contains(&d) {
+        format!("{:+}", d)  // "+0", "+1", "-1", ... (keeps columns aligned)
+    } else {
+        format!("0x{:04x}", d as u16)
+    }
+}
+
 /// Offset-free, insertion-stable, bit-complete dump:
-/// [attr,abcdefgh] [mark,%04x] [delta,%04x;+d] [textLen,%04x] "text"
+/// <attrbits> mark=-1:+|-2:-|0xnnnn delta=+1|0|-1|0xnnnn textLen=%04x "text"
 /// If a note exists, emit on following lines:
-///   [noteLen=%04x]
-///   [note]
+///   noteLen=%04x
+///   note
 ///   <note text...>   (CRLF normalized to LF)
-///   [/note]
-fn render_canon(recs: &[Rec]) -> String {
+///   /note
+fn render_canon(recs: &[Rec], show_cursor: bool) -> String {
     let mut out = String::new();
     for r in recs {
-        // raw marker (u16 LE): FFFF=expanded, FFFE=collapsed
-        let mark_le: u16 = if r.collapsed { 0xFFFE } else { 0xFFFF };
-        // raw delta (two's complement of i16)
-        let delta_raw: u16 = r.delta as u16;
-        // raw length from file
+        let mark = mark_field(r.marker_u16);
+        let delta_disp = delta_field(r.delta);
         let text_len_raw: u16 = r.len_text as u16;
 
-        out.push_str(&format!("[attr,{}] [mark,{:04x}] [delta,{:04x};{:+}] [textLen,{:04x}] \"{}\"\n",
-            fmt_attr_bits(r.attr), mark_le, delta_raw, r.delta, text_len_raw, escape_headline(&r.text)));
+        out.push_str(&format!(
+            "{} mark={} delta={} textLen={:04x} \"{}\"\n",
+            fmt_attr_bits(r.attr, show_cursor),
+            mark,
+            delta_disp,
+            text_len_raw,
+            escape_headline(&r.text)
+        ));
 
         if r.flags.has_note {
-            out.push_str(&format!("[noteLen={:04x}]\n", r.note_len as u16));
-            out.push_str("[note]\n");
+            out.push_str(&format!("noteLen={:04x}\n", r.note_len as u16));
+            out.push_str("note\n");
             let note_norm = r.note.as_deref().unwrap_or("").replace("\r\n", "\n");
             out.push_str(&note_norm);
             if !note_norm.ends_with('\n') { out.push('\n'); }
-            out.push_str("[/note]\n");
+            out.push_str("/note\n");
         }
     }
     out
 }
 
-/// Validate derived invariants and print warnings to stderr
-fn validate(recs: &[Rec]) {
+/// Validate derived invariants and print warnings to stderr.
+/// By default we only assert bits we're confident in (0x08 sibling follows).
+/// Use `assume_child_bit=true` to test the hypothesis that 0x04 == "has child".
+fn validate(recs: &[Rec], assume_child_bit: bool) {
     // compute levels
     let mut levels = Vec::with_capacity(recs.len());
     let mut lvl = 0i32;
@@ -392,58 +435,67 @@ fn validate(recs: &[Rec]) {
         levels.push(lvl);
     }
 
-    // A_SIBLING = has any later sibling at the same level (before subtree ends)
     for i in 0..recs.len() {
         let my = levels[i];
+
+        // 0x08 sibling-follows check -- solid
         let mut has_later_sibling = false;
         for j in (i + 1)..recs.len() {
-            if levels[j] < my { break; }          // left this subtree
+            if levels[j] < my { break; }
             if levels[j] == my { has_later_sibling = true; break; }
         }
-        let bit = (recs[i].attr & A_SIBLING) != 0;
-        if has_later_sibling != bit {
-            eprintln!("WARN: rec #{:03} sibling bit mismatch (attr={}, expected={}) at attr[{:#06x}]", i, bit, has_later_sibling, recs[i].off_attr);
-        }
-
-        let has_child = i + 1 < recs.len() && levels[i + 1] > my;
-        let bit_child = (recs[i].attr & A_HASKIDS) != 0;
-        if has_child != bit_child {
+        let bit_sib = (recs[i].attr & A_SIBFOLLOWS) != 0;
+        if has_later_sibling != bit_sib {
             eprintln!(
-              "WARN: rec #{:03} child bit mismatch (attr={}, expected={}) at attr[{:#06x}]",
-              i, bit_child, has_child, recs[i].off_attr
+                "WARN: rec #{:03} sibling bit mismatch (attr={}, expected={}) at attr[{:#06x}]",
+                i, bit_sib, has_later_sibling, recs[i].off_attr
             );
         }
 
-        // Unknown bits: exclude the four mapped ones
-        let unknown = recs[i].attr & !(A_NOTE | A_CURSOR | A_SIBLING | A_HASKIDS);
-        if unknown != 0 {
-            eprintln!("WARN: rec #{:03} unknown attr bits set: 0x{:02x} at attr[{:#06x}]", i, unknown, recs[i].off_attr);
+        // Optional hypothesis check for 0x04
+        if assume_child_bit {
+            let has_child_struct = i + 1 < recs.len() && levels[i + 1] > my;
+            let bit_child = (recs[i].attr & A_HASKIDS) != 0;
+            if has_child_struct != bit_child {
+                eprintln!(
+                    "WARN: rec #{:03} 0x04!=has_child (attr={}, expected={}) at attr[{:#06x}]",
+                    i, bit_child, has_child_struct, recs[i].off_attr
+                );
+            }
         }
-    }
 
-    // selection bit sanity
-    let selected: Vec<_> = recs.iter().enumerate().filter(|(_,r)| r.flags.selected).map(|(i,_)| i).collect();
-    if selected.len() > 1 {
-        eprintln!("WARN: multiple selections set at indices {:?}", selected);
+        // Unknown bits: exclude 0x80, 0x20, 0x08, 0x04 always (we show 0x04 but don't warn by default)
+        let known = A_NOTE | A_CURSOR | A_SIBFOLLOWS | A_HASKIDS;
+        let unknown = recs[i].attr & !known;
+        if unknown != 0 {
+            eprintln!(
+                "WARN: rec #{:03} unknown attr bits set: 0x{:02x} at attr[{:#06x}]",
+                i, unknown, recs[i].off_attr
+            );
+        }
     }
 }
 
 /**************
  * --diff mode
  **************/
-fn render_mark(collapsed: bool) -> &'static str { if collapsed { "fffe" } else { "ffff" } }
-fn render_delta(r: &Rec) -> String { format!("{:04x};{:+}", r.delta as u16, r.delta) }
+fn render_mark_for_diff(u: u16) -> String { mark_field(u) }
+fn render_delta_for_diff(d: i16) -> String { delta_field(d) }
 
-fn diff_two_recs(prev: &Rec, curr: &Rec) -> Vec<String> {
+fn diff_two_recs(prev: &Rec, curr: &Rec, show_cursor: bool) -> Vec<String> {
     let mut changes = Vec::new();
     if prev.attr != curr.attr {
-        changes.push(format!("  attr: {} -> {}", fmt_attr_bits(prev.attr), fmt_attr_bits(curr.attr)));
+        changes.push(format!(
+            "  attr: {} -> {}",
+            fmt_attr_bits(prev.attr, show_cursor),
+            fmt_attr_bits(curr.attr, show_cursor)
+        ));
     }
-    if prev.collapsed != curr.collapsed {
-        changes.push(format!("  mark: {} -> {}", render_mark(prev.collapsed), render_mark(curr.collapsed)));
+    if prev.marker_u16 != curr.marker_u16 {
+        changes.push(format!("  mark: {} -> {}", render_mark_for_diff(prev.marker_u16), render_mark_for_diff(curr.marker_u16)));
     }
     if prev.delta != curr.delta {
-        changes.push(format!("  delta: {} -> {}", render_delta(prev), render_delta(curr)));
+        changes.push(format!("  delta: {} -> {}", render_delta_for_diff(prev.delta), render_delta_for_diff(curr.delta)));
     }
     if prev.len_text != curr.len_text {
         changes.push(format!("  textLen: {:04x} -> {:04x}", prev.len_text as u16, curr.len_text as u16));
@@ -463,7 +515,7 @@ fn diff_two_recs(prev: &Rec, curr: &Rec) -> Vec<String> {
     changes
 }
 
-fn diff_mode(prev: &[Rec], curr: &[Rec]) -> String {
+fn diff_mode(prev: &[Rec], curr: &[Rec], show_cursor: bool) -> String {
     // Greedy match by heading text (first unmatched occurrence)
     let mut out = String::new();
     let mut used_prev = vec![false; prev.len()];
@@ -479,7 +531,7 @@ fn diff_mode(prev: &[Rec], curr: &[Rec]) -> String {
         }
         if let Some(j) = match_idx {
             used_prev[j] = true;
-            let changes = diff_two_recs(&prev[j], c);
+            let changes = diff_two_recs(&prev[j], c, show_cursor);
             if !changes.is_empty() {
                 out.push_str(&format!("~ \"{}\"\n", c.text));
                 for line in changes { out.push_str(&line); out.push('\n'); }
@@ -497,20 +549,20 @@ fn diff_mode(prev: &[Rec], curr: &[Rec]) -> String {
 }
 
 fn main() -> io::Result<()> {
-    // Fast path: --diff <prev> <curr>
+    // Fast path: --diff <prev> <curr> [--show-cursor]
     let raw_args: Vec<String> = env::args().skip(1).collect();
     if raw_args.get(0).map(|s| s.as_str()) == Some("--diff") {
-        if raw_args.len() != 3 {
+        // Accept optional --show-cursor as a trailing flag
+        let show_cursor = raw_args.iter().any(|s| s == "--show-cursor");
+        let paths: Vec<&str> = raw_args.iter().skip(1).filter(|s| s.as_str() != "--show-cursor").map(|s| s.as_str()).collect();
+        if paths.len() != 2 {
             usage(&env::args().next().unwrap_or_else(|| "otl".into()));
         }
-        let prev_path = &raw_args[1];
-        let curr_path = &raw_args[2];
-        let prev_buf = fs::read(prev_path)?;
-        let curr_buf = fs::read(curr_path)?;
-        // default encoding latin1 for diff mode
+        let prev_buf = fs::read(paths[0])?;
+        let curr_buf = fs::read(paths[1])?;
         let prev_recs = parse_otl(&prev_buf, "latin1")?;
         let curr_recs = parse_otl(&curr_buf, "latin1")?;
-        let report = diff_mode(&prev_recs, &curr_recs);
+        let report = diff_mode(&prev_recs, &curr_recs, show_cursor);
         print!("{report}");
         return Ok(());
     }
@@ -525,6 +577,8 @@ fn main() -> io::Result<()> {
     let mut plain_text = false;
     let mut canon = false;
     let mut enc = String::from("latin1");
+    let mut assume_child_bit = false;
+    let mut show_cursor = false;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -534,6 +588,8 @@ fn main() -> io::Result<()> {
             "--validate" => do_validate = true,
             "--text" => plain_text = true,
             "--canon" => canon = true,
+            "--assume-child-bit" => assume_child_bit = true,
+            "--show-cursor" => show_cursor = true,
             "--enc" => {
                 if let Some(v) = args.next() { enc = v; } else {
                     usage(&env::args().next().unwrap_or_else(|| "otl".into()));
@@ -558,7 +614,7 @@ fn main() -> io::Result<()> {
 
     let recs = parse_otl(&buf, &enc)?;
     if do_validate {
-        validate(&recs);
+        validate(&recs, assume_child_bit);
     }
     if do_dump {
         print!("{}", dump_recs(&recs));
@@ -577,7 +633,7 @@ fn main() -> io::Result<()> {
     } else if plain_text {
         print!("{}", render_plain_all(&tree, 0));
     } else if canon {
-        print!("{}", render_canon(&recs));
+        print!("{}", render_canon(&recs, show_cursor));
     } else {
         print!("{}", render_indented(&tree, ""));
     }

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # watch-otl.sh -- watch one .OTL file OR all .OTL files in a directory.
-# - Archives every validated change (timestamped copy of the .OTL).
+# - Archives each validated change:
+#     <stem>.<YYYYMMDD_HHMMSS_mmm>.OTL          (binary)
+#     <stem>.<YYYYMMDD_HHMMSS_mmm>.canon.txt     (raw otl --canon)
 # - Shows zero-context unified diffs of canonical output (note bodies omitted).
 # - No byte-level diffs.
 #
 # Env:
-#   OTL_ARCHDIR      Override archive dir (default: <dir>/.otl-archive)
-#   ALWAYS_ARCHIVE=1 Archive on every write, even if canonical unchanged
+#   OTL_ARCHDIR        Override archive dir (default: <dir>/.otl-archive)
+#   ALWAYS_ARCHIVE=1   Archive on every write, even if canonical unchanged
 
 die() { printf %s "${@+$@$'\n'}" 1>&2 ; exit 1 ; }
 see() ( { set -x; } 2>/dev/null ; "$@" )
@@ -24,7 +26,7 @@ Examples:
 Notes:
   - Requires: inotifywait (inotify-tools), diff, awk.
   - Finds 'otl' in PATH; else uses ./target/release/otl.
-  - Archives to: <dir>/.otl-archive/<name>.<YYYYMMDD_HHMMSS_mmm>.OTL
+  - Archives to: <dir>/.otl-archive/<stem>.<YYYYMMDD_HHMMSS_mmm>.{OTL,canon.txt}
 USAGE
   exit 2
 }
@@ -45,7 +47,7 @@ if have otl; then OTL=otl
 elif [ -x ./target/release/otl ]; then OTL=./target/release/otl
 else die "Could not find 'otl' (PATH or ./target/release/otl)"; fi
 
-# Ensure --canon present (we'll filter note bodies below)
+# Ensure --canon present (we'll filter note bodies below for diffs)
 case " ${EXTRA_ARGS[*]} " in
   *" --canon "*) : ;;
   *) EXTRA_ARGS=(--canon "${EXTRA_ARGS[@]}");;
@@ -53,26 +55,26 @@ esac
 
 abspath() { cd "$(dirname "$1")" && pwd -P; }
 is_otl() {
-  local f="$1"; case "$f" in
+  case "$1" in
     *.OTL|*.otl) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-# Per-dir state: archive + baseline store
+# Per-dir state: baseline store
 STATE_DIR() { local d; d="$(abspath "$1")"; printf %s "$d/.otl-watch"; }
 ARCH_DIR()  {
   local d; d="$(abspath "$1")"
   printf %s "${OTL_ARCHDIR:-$d/.otl-archive}"
 }
 
-# Produce canonical text with note bodies omitted (keeps [noteLen], [note], [/note])
+# Produce canonical text with note bodies omitted (keeps "noteLen=", "note", "/note")
 filter_canon() {
   awk '
     BEGIN { in_note=0 }
-    /^\[note\]$/   { in_note=1; print "[note]"; print "[note body omitted]"; next }
-    /^\[\/note\]$/ { in_note=0; print "[/note]"; next }
-    in_note == 1   { next }
+    /^note$/      { in_note=1; print "note"; print "[note body omitted]"; next }
+    /^\/note$/    { in_note=0; print "/note"; next }
+    in_note == 1  { next }
     { print }
   ' "$1"
 }
@@ -91,18 +93,6 @@ ensure_baseline() {
   rm -f "$tmp"
 }
 
-# Archive a validated snapshot
-archive_copy() {
-  local file="$1"
-  local arch; arch="$(ARCH_DIR "$file")"
-  mkdir -p "$arch" 2>/dev/null || :
-  local stem ext ts outpath
-  stem="$(basename "$file")"; ext="${stem##*.}"; stem="${stem%.*}"
-  ts=$(date +%Y%m%d_%H%M%S_%3N)
-  outpath="$arch/${stem}.${ts}.${ext}"
-  cp -f -- "$file" "$outpath" && echo "Archived: $outpath"
-}
-
 # Handle one write/rename event for a file
 handle_file_event() {
   local file="$1"
@@ -119,7 +109,6 @@ handle_file_event() {
     cp -f -- "$file" "$tmpbin" 2>/dev/null || { rm -f "$tmpbin"; sleep 0.05; continue; }
 
     canon_raw="$(mktemp -t ".canon.$(basename "$file").raw.XXXXXX")" || { rm -f "$tmpbin"; return 0; }
-    # Capture warnings (stderr) separately
     warn="$(mktemp -t ".otl.warn.XXXXXX")" || { rm -f "$tmpbin" "$canon_raw"; return 0; }
     "$OTL" "${EXTRA_ARGS[@]}" "$tmpbin" >"$canon_raw" 2>"$warn"
     last_rc=$?
@@ -140,10 +129,28 @@ handle_file_event() {
       if [ -n "$diffout" ]; then
         echo "Canonical diff (no context; note bodies omitted):"
         printf "%s\n" "$diffout" | sed 's/^/  /'
-        archive_copy "$file"
+
+        # Archive binary + raw canonical with the SAME timestamp
+        local arch; arch="$(ARCH_DIR "$file")"; mkdir -p "$arch" 2>/dev/null || :
+        local stem ext ts bin_out canon_out
+        stem="$(basename "$file")"; ext="${stem##*.}"; stem="${stem%.*}"
+        ts=$(date +%Y%m%d_%H%M%S_%3N)
+        bin_out="$arch/${stem}.${ts}.${ext}"
+        canon_out="$arch/${stem}.${ts}.canon.txt"
+        cp -f -- "$tmpbin" "$bin_out"   && echo "Archived: $bin_out"
+        cp -f -- "$canon_raw" "$canon_out" && echo "Archived: $canon_out"
       else
         echo "Canonical diff: (none)"
-        if [[ -n "${ALWAYS_ARCHIVE:-}" ]]; then archive_copy "$file"; fi
+        if [[ -n "${ALWAYS_ARCHIVE:-}" ]]; then
+          local arch; arch="$(ARCH_DIR "$file")"; mkdir -p "$arch" 2>/dev/null || :
+          local stem ext ts bin_out canon_out
+          stem="$(basename "$file")"; ext="${stem##*.}"; stem="${stem%.*}"
+          ts=$(date +%Y%m%d_%H%M%S_%3N)
+          bin_out="$arch/${stem}.${ts}.${ext}"
+          canon_out="$arch/${stem}.${ts}.canon.txt"
+          cp -f -- "$tmpbin" "$bin_out"   && echo "Archived (ALWAYS): $bin_out"
+          cp -f -- "$canon_raw" "$canon_out" && echo "Archived (ALWAYS): $canon_out"
+        fi
       fi
 
       # Validator warnings (if user supplied --validate)
@@ -169,7 +176,7 @@ handle_file_event() {
 # -------- main --------
 if [ -d "$TARGET" ]; then
   DIR="$(cd "$TARGET" && pwd -P)"
-  # Build baselines for existing *.OTL files
+  # Baselines for existing *.OTL files
   shopt -s nullglob
   for f in "$DIR"/*.OTL "$DIR"/*.otl; do ensure_baseline "$f"; done
   shopt -u nullglob
@@ -179,11 +186,9 @@ if [ -d "$TARGET" ]; then
   echo "Archive base: $(ARCH_DIR "$DIR")"
   echo
 
-  # Monitor directory for close_write and moved_to
   inotifywait -m -q -e close_write -e moved_to --format '%e %w%f' -- "$DIR" \
   | while read -r ev path; do
       is_otl "$path" || continue
-      # coalesce flurries per path (optional; simple small delay)
       handle_file_event "$path"
     done
 
