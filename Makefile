@@ -33,6 +33,7 @@ help:
 	@echo "  binpath      Print built binary path"
 	@echo "  skpdoc       Build PDF for about_skplus/cmds_key_mappings.md and open"
 	@echo "  %.pdf        Generic: build PDF from Markdown via pandoc"
+	@echo "  roundtrip    Round-trip all .OTL under ~/SKPLUS (read-only src)"
 
 # -------- Pandoc PDF (Markdown -> PDF) --------
 PANDOC ?= pandoc
@@ -96,3 +97,9 @@ diff:
 
 binpath:
 	@echo $(TARGET_DIR)/$(BIN)
+
+# Round-trip real files under a source directory (read-only), defaulting to ~/SKPLUS
+.PHONY: roundtrip
+roundtrip:
+	@echo "Round-tripping .OTL files under $${OTL_SRC_RO_DIR:-$$HOME/SKPLUS} ..."
+	OTL_SRC_RO_DIR=$${OTL_SRC_RO_DIR:-$$HOME/SKPLUS} $(CARGO) test roundtrip_real_dir -- --ignored --nocapture
