@@ -2,6 +2,15 @@
 
 Provide comprehension of the file format (extension .OTL) used by the (circa 1988) Borland MS-DOS "Sidekick Plus" Outliner (called Outlook).
 
+# Build & Dev
+
+- Build: `make build` (use `RELEASE=0` for debug). Binary: `target/(release|debug)/otl`.
+- Run: `make run ARGS='--canon path/to/file.OTL'`
+- JSON: `make json FILE=path/to/file.OTL`
+- Diff: `make diff PREV=prev.OTL CURR=curr.OTL CURSOR=1`
+- Watch: `make watch TARGET=<file|dir> ARGS='--validate'` (needs `inotifywait`, `diff`, `awk`).
+- Hygiene: `make check` (fmt + clippy + test). All targets: `make help`.
+
 # Storytime
 
 As someone who *actually used* DOS-era outliners (and found them VERY
