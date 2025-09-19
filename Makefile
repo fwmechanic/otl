@@ -2,6 +2,7 @@
 
 CARGO ?= cargo
 BIN    ?= otl
+OTLDIR ?= $(HOME)/SKPLUS
 
 # Set RELEASE=0 for debug builds
 RELEASE ?= 1
@@ -28,7 +29,7 @@ help:
 	@echo "  check        fmt + clippy + test"
 	@echo "  canon FILE=  Print canonical dump for FILE"
 	@echo "  json FILE=   Print JSON for FILE"
-	@echo "  watch TARGET= [ARGS=..]  Use watch-otl.sh on file/dir"
+	@echo "  watch [OTLDIR=..] [ARGS=..]  Watch dir with watch-otl.sh (default: ~/SKPLUS)"
 	@echo "  diff PREV= CURR= [CURSOR=1]  Canon diff two .OTL files"
 	@echo "  binpath      Print built binary path"
 	@echo "  skpdoc       Build PDF for about_skplus/cmds_key_mappings.md and open"
@@ -88,8 +89,9 @@ json:
 	$(CARGO) run $(BUILD_MODE) -- --json $(FILE)
 
 watch:
-	@test -n "$(TARGET)" || (echo "Usage: make watch TARGET=<file|dir> [ARGS='--validate']" && exit 2)
-	./watch-otl.sh $(TARGET) -- $(ARGS)
+	@test -n "$(OTLDIR)" || (echo "Usage: make watch OTLDIR=<file|dir> [ARGS='--validate']" && exit 2)
+	@echo "Watching: $(OTLDIR)"
+	./watch-otl.sh $(OTLDIR) -- $(ARGS)
 
 diff:
 	@test -n "$(PREV)" -a -n "$(CURR)" || (echo "Usage: make diff PREV=prev.OTL CURR=curr.OTL [CURSOR=1]" && exit 2)
