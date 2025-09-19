@@ -70,3 +70,14 @@ Base Feature-list:
 
 Extra Feature-list:
  - URL recognition (hiding) and "execution" (`xdg_open`/`start`?)
+
+
+```
+                                                      ch8 Outlook                         ch7 Notepad
+                                                      |       Outlook Cmd Diagram          |
+                                                      |       |   ch13 Installing          |
+                                                      |       |   |       ch14 Changing    |
+                                                      |       |   |       |       ch15 DYO |
+                                                      |       |   |       |       |        |
+cutpdf Borland.Sidekick.Plus.Owners.Handbook.1988.pdf 145-172,444,317-354,359-360,411-414,125-144
+```
